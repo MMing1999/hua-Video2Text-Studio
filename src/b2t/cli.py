@@ -341,6 +341,7 @@ def _run_server(*, host: str, port: int, provider: str | None, model: str | None
         task_service=service,
         library=service.library,
         database=service.database,
+        settings=settings,
         default_provider=provider or config.default_provider,
         default_model=model or config.default_model,
         language=config.language,
@@ -374,7 +375,7 @@ def _build_task_service(
         library=library,
         pipeline_factory=lambda selected_provider, selected_model: build_pipeline(
             settings=settings,
-            config=config,
+            config=AppConfig.load(settings),
             provider=selected_provider or provider or config.default_provider,
             model=selected_model or model or config.default_model,
             cookies_from_browser=cookies_from_browser,

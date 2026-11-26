@@ -21,9 +21,10 @@ class YtDlpDownloader(Downloader):
         settings: Settings,
         *,
         progress=None,
+        keep_video: bool | None = None,
     ) -> DownloadResult:
-        if source.kind != "bilibili":
-            raise ValueError("yt-dlp downloader only supports bilibili sources")
+        if not source.url and not source.bv:
+            raise ValueError("yt-dlp downloader requires a remote url")
 
         settings.ensure_directories()
 
@@ -34,7 +35,7 @@ class YtDlpDownloader(Downloader):
                 "yt-dlp is not installed. Run `uv sync` to install the core dependencies."
             ) from exc
 
-        ydl_opts = self._build_ydl_opts(source, settings)
+        ydl_opts = self._build_ydl_opts(source, settings, keep_video=keep_video)
         if progress is not None:
             def progress_hook(data: dict[str, Any]) -> None:
                 status = data.get("status")
@@ -53,8 +54,9 @@ class YtDlpDownloader(Downloader):
             ydl_opts["progress_hooks"] = [progress_hook]
             ydl_opts["noprogress"] = False
 
+        target_url = source.url or f"https://www.bilibili.com/video/{source.bv}"
         with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(source.url or f"https://www.bilibili.com/video/{source.bv}", download=True)
+            info = ydl.extract_info(target_url, download=True)
             if "entries" in info and info["entries"]:
                 info = info["entries"][0]
             info = ydl.sanitize_info(info)
@@ -77,7 +79,13 @@ class YtDlpDownloader(Downloader):
             },
         )
 
-    def _build_ydl_opts(self, source: SourceRef, settings: Settings) -> dict[str, Any]:
+    def _build_ydl_opts(
+        self,
+        source: SourceRef,
+        settings: Settings,
+        *,
+        keep_video: bool | None = None,
+    ) -> dict[str, Any]:
         ydl_opts: dict[str, Any] = {
             "noplaylist": True,
             "outtmpl": str(settings.downloads_dir / "%(id)s.%(ext)s"),
@@ -88,17 +96,17 @@ class YtDlpDownloader(Downloader):
 
         # Transcription only needs the audio track, so download audio-only by
         # default instead of the best video (which can be a multi-GB 4K file
-        # that `ffmpeg -vn` immediately discards). Set B2T_KEEP_VIDEO=1 or pass
-        # --keep-video to download and keep the full video as well.
-        keep_video = os.getenv("B2T_KEEP_VIDEO", "").strip().lower() in {"1", "true", "yes", "on"}
+        # that `ffmpeg -vn` immediately discards). Pass keep_video=True or set
+        # B2T_KEEP_VIDEO=1 / --keep-video to download and keep the full video.
+        if keep_video is None:
+            keep_video = os.getenv("B2T_KEEP_VIDEO", "").strip().lower() in {"1", "true", "yes", "on"}
         if keep_video:
             ydl_opts["format"] = "bv*+ba/b"
             ydl_opts["merge_output_format"] = "mp4"
         else:
             ydl_opts["format"] = "ba/bestaudio/best"
 
-        # Support cookies for authenticated access to Bilibili.
-        # Priority: B2T_COOKIE_FILE env var > cookies.txt in workspace.
+        # Cookies: env B2T_COOKIE_FILE > workspace cookies.txt
         cookie_file = os.getenv("B2T_COOKIE_FILE")
         if cookie_file:
             cookie_path = Path(cookie_file).expanduser()
@@ -107,22 +115,19 @@ class YtDlpDownloader(Downloader):
         if cookie_path.exists():
             ydl_opts["cookiefile"] = str(cookie_path)
 
-        # --cookies-from-browser extracts live cookies directly from a
-        # browser profile, which is more reliable than a static cookies.txt
-        # for bypassing Bilibili's anti-bot (WBI) checks.
         # Priority: constructor arg > B2T_COOKIES_FROM_BROWSER env var.
+        # Useful for X / Instagram / Facebook / age-gated YouTube / B 站风控.
         cfbr = self.cookies_from_browser or os.getenv("B2T_COOKIES_FROM_BROWSER")
         if cfbr:
-            ydl_opts["cookiesfrombrowser"] = (cfbr,)
+            ydl_opts["cookiesfrombrowser"] = (cfbr.strip(),)
 
-        # Bilibili's CDN frequently blocks proxy/VPN nodes, causing 412
-        # or SSL errors. Direct connections usually work better.
-        # Set B2T_USE_PROXY=1 to re-enable the system proxy if needed.
+        # Default: ignore system proxy (helps B 站 CDN). Set B2T_USE_PROXY=1 to keep it.
+        # YouTube / 海外站若需代理，请显式打开。
         use_proxy = os.getenv("B2T_USE_PROXY", "").strip().lower() in {"1", "true", "yes", "on"}
         if not use_proxy:
             ydl_opts["proxy"] = ""
 
-        if source.page is not None:
+        if source.kind == "bilibili" and source.page is not None:
             ydl_opts["playlist_items"] = str(source.page)
             ydl_opts["noplaylist"] = False
             ydl_opts["outtmpl"] = str(settings.downloads_dir / "%(id)s.%(playlist_index)02d.%(ext)s")

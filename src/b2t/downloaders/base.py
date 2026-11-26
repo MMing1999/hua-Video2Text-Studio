@@ -17,5 +17,6 @@ class Downloader(ABC):
         settings: Settings,
         *,
         progress: ProgressReporter | None = None,
+        keep_video: bool | None = None,
     ) -> DownloadResult:
         raise NotImplementedError

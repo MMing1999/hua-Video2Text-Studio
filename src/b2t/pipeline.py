@@ -33,6 +33,8 @@ class B2TPipeline:
         prompt: str | None = None,
         output: Path | None = None,
         progress: ProgressReporter | None = None,
+        keep_video: bool | None = None,
+        output_format: str = "txt",
     ) -> TranscriptResult:
         self.settings.ensure_directories()
         if progress is not None:
@@ -40,8 +42,24 @@ class B2TPipeline:
         source = parse_source(source_input)
         downloaded: DownloadResult | None = None
 
-        if source.kind == "bilibili":
-            downloaded = self.downloader.download(source, self.settings, progress=progress)
+        if source.kind == "audio":
+            assert source.path is not None
+            audio_path = source.path
+            base_name = source.display_name
+            video_path = None
+        elif source.kind == "video":
+            assert source.path is not None
+            audio_path = self._extract_audio(source.path, safe_stem(source.display_name), progress=progress)
+            base_name = source.display_name
+            video_path = source.path
+        else:
+            # bilibili / youtube / acfun / social / … via yt-dlp
+            downloaded = self.downloader.download(
+                source,
+                self.settings,
+                progress=progress,
+                keep_video=keep_video,
+            )
             audio_path = self._extract_audio(
                 downloaded.video_path,
                 safe_stem(downloaded.title or source.display_name),
@@ -49,16 +67,6 @@ class B2TPipeline:
             )
             base_name = downloaded.title or source.display_name
             video_path = downloaded.video_path
-        elif source.kind == "video":
-            assert source.path is not None
-            audio_path = self._extract_audio(source.path, safe_stem(source.display_name), progress=progress)
-            base_name = source.display_name
-            video_path = source.path
-        else:
-            assert source.path is not None
-            audio_path = source.path
-            base_name = source.display_name
-            video_path = None
 
         transcription = self.transcriber.transcribe(audio_path, prompt=prompt, progress=progress)
         text = transcription.get("text", "").strip()
@@ -67,7 +75,8 @@ class B2TPipeline:
 
         if progress is not None:
             progress.running("writing_outputs", message="writing_outputs", indeterminate=True)
-        transcript_path = self._resolve_output_path(base_name, output)
+        fmt = _normalize_output_format(output_format)
+        transcript_path = self._resolve_output_path(base_name, output, output_format=fmt)
         metadata_path = self._resolve_metadata_path(transcript_path)
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
         transcript_path.write_text(text + "\n", encoding="utf-8")
@@ -86,6 +95,7 @@ class B2TPipeline:
             "video_path": str(video_path) if video_path else None,
             "download": downloaded.metadata if downloaded else None,
             "language": transcription.get("language"),
+            "output_format": fmt,
             "generated_at": datetime.now().isoformat(),
         }
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -181,22 +191,36 @@ class B2TPipeline:
             raise RuntimeError(f"ffmpeg failed to extract audio: {stderr}")
         return audio_path
 
-    def _resolve_output_path(self, base_name: str, output: Path | None) -> Path:
+    def _resolve_output_path(
+        self,
+        base_name: str,
+        output: Path | None,
+        *,
+        output_format: str = "txt",
+    ) -> Path:
+        suffix = ".md" if output_format == "markdown" else ".txt"
         if output is None:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            return self.settings.transcripts_original_dir / f"{safe_stem(base_name)}-{timestamp}.txt"
+            return self.settings.transcripts_original_dir / f"{safe_stem(base_name)}-{timestamp}{suffix}"
 
         output = output.expanduser()
-        if output.suffix.lower() != ".txt":
+        if output.suffix.lower() not in {".txt", ".md"}:
             if output.exists() and output.is_dir():
-                return output / f"{safe_stem(base_name)}.txt"
-            return output.with_suffix(".txt")
+                return output / f"{safe_stem(base_name)}{suffix}"
+            return output.with_suffix(suffix)
         return output
 
     def _resolve_metadata_path(self, transcript_path: Path) -> Path:
         if transcript_path.is_relative_to(self.settings.workspace_root):
             return self.settings.metadata_dir / f"{transcript_path.stem}.json"
         return transcript_path.with_suffix(".json")
+
+
+def _normalize_output_format(value: str | None) -> str:
+    raw = (value or "txt").strip().lower()
+    if raw in {"md", "markdown"}:
+        return "markdown"
+    return "txt"
 
 
 def _parse_ffmpeg_progress_seconds(line: str) -> float | None:

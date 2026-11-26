@@ -70,3 +70,29 @@ def test_parse_source_list_ignores_blank_lines_and_comments() -> None:
 
 def test_safe_stem_removes_unsafe_characters() -> None:
     assert safe_stem("hello / world?") == "hello-world"
+
+
+@pytest.mark.parametrize(
+    ("url", "kind"),
+    [
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube"),
+        ("https://youtu.be/dQw4w9WgXcQ", "youtube"),
+        ("https://www.acfun.cn/v/ac123456", "acfun"),
+        ("https://x.com/user/status/123", "twitter"),
+        ("https://twitter.com/user/status/123", "twitter"),
+        ("https://www.instagram.com/reel/ABC/", "instagram"),
+        ("https://www.facebook.com/watch/?v=123", "facebook"),
+        ("https://www.douyin.com/video/7123", "douyin"),
+        ("https://www.xiaohongshu.com/explore/abc", "xiaohongshu"),
+        ("https://www.rednote.com/explore/abc", "xiaohongshu"),
+    ],
+)
+def test_parse_supported_platform_urls(url: str, kind: str) -> None:
+    source = parse_source(url)
+    assert source.kind == kind
+    assert source.url == url
+
+
+def test_parse_rejects_unknown_host() -> None:
+    with pytest.raises(ValueError, match="unsupported url host"):
+        parse_source("https://example.com/video/1")

@@ -13,7 +13,14 @@ class FakeDownloader(Downloader):
     def __init__(self, video_path: Path) -> None:
         self.video_path = video_path
 
-    def download(self, source: SourceRef, settings: Settings, *, progress=None) -> DownloadResult:
+    def download(
+        self,
+        source: SourceRef,
+        settings: Settings,
+        *,
+        progress=None,
+        keep_video: bool | None = None,
+    ) -> DownloadResult:
         return DownloadResult(
             source=source,
             video_path=self.video_path,

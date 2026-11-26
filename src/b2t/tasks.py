@@ -34,6 +34,8 @@ class TaskService:
         provider: str,
         model: str,
         prompt: str = "",
+        keep_video: bool = False,
+        output_format: str = "txt",
         listener: ProgressCallback | None = None,
     ) -> TaskRecord:
         task = self.database.create_task(
@@ -46,7 +48,16 @@ class TaskService:
             self.add_listener(task.id, listener)
         reporter = ProgressReporter(task.id, callback=self._handle_progress)
         reporter.queued("queued")
-        future = self.executor.submit(self._run_transcription, task.id, source, provider, model, prompt)
+        future = self.executor.submit(
+            self._run_transcription,
+            task.id,
+            source,
+            provider,
+            model,
+            prompt,
+            keep_video,
+            output_format,
+        )
         with self._lock:
             self._futures[task.id] = future
         return task
@@ -71,12 +82,27 @@ class TaskService:
     def list_tasks(self) -> list[TaskRecord]:
         return self.database.list_tasks()
 
-    def _run_transcription(self, task_id: str, source: str, provider: str, model: str, prompt: str) -> None:
+    def _run_transcription(
+        self,
+        task_id: str,
+        source: str,
+        provider: str,
+        model: str,
+        prompt: str,
+        keep_video: bool = False,
+        output_format: str = "txt",
+    ) -> None:
         reporter = ProgressReporter(task_id, callback=self._handle_progress)
         try:
             reporter.running("preparing", message="preparing")
             pipeline = self.pipeline_factory(provider, model)
-            result = pipeline.transcribe(source, prompt=prompt or None, progress=reporter)
+            result = pipeline.transcribe(
+                source,
+                prompt=prompt or None,
+                progress=reporter,
+                keep_video=keep_video,
+                output_format=output_format,
+            )
             reporter.running("indexing", message="indexing", stage_progress=0.5)
             video_id = self.library.register_transcript_result(result)
             reporter.completed("completed")

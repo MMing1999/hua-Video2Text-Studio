@@ -97,8 +97,9 @@ def build_pipeline(
     else:
         raise RuntimeError(f"Unsupported provider: {selected_provider}")
 
+    cfbr = (cookies_from_browser or config.download.cookies_from_browser or "").strip() or None
     return B2TPipeline(
         settings=settings,
-        downloader=YtDlpDownloader(cookies_from_browser=cookies_from_browser),
+        downloader=YtDlpDownloader(cookies_from_browser=cfbr),
         transcriber=transcriber,
     )

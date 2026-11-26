@@ -13,6 +13,7 @@ class Settings:
     workspace_root: Path
     downloads_dir: Path
     audio_dir: Path
+    uploads_dir: Path
     transcripts_dir: Path
     transcripts_original_dir: Path
     transcripts_edited_dir: Path
@@ -29,6 +30,7 @@ class Settings:
             workspace_root=root,
             downloads_dir=root / "downloads",
             audio_dir=root / "audio",
+            uploads_dir=root / "uploads",
             transcripts_dir=root / "transcripts",
             transcripts_original_dir=root / "transcripts" / "original",
             transcripts_edited_dir=root / "transcripts" / "edited",
@@ -44,6 +46,7 @@ class Settings:
             self.workspace_root,
             self.downloads_dir,
             self.audio_dir,
+            self.uploads_dir,
             self.transcripts_dir,
             self.transcripts_original_dir,
             self.transcripts_edited_dir,

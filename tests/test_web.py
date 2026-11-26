@@ -17,9 +17,19 @@ class FakePipeline:
         self.provider = provider
         self.model = model
 
-    def transcribe(self, source: str, *, prompt: str | None = None, output: Path | None = None, progress=None) -> TranscriptResult:
+    def transcribe(
+        self,
+        source: str,
+        *,
+        prompt: str | None = None,
+        output: Path | None = None,
+        progress=None,
+        keep_video: bool | None = None,
+        output_format: str = "txt",
+    ) -> TranscriptResult:
         source_id = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
-        transcript_path = self.settings.transcripts_original_dir / f"demo-{source_id}.txt"
+        suffix = ".md" if str(output_format).lower() in {"md", "markdown"} else ".txt"
+        transcript_path = self.settings.transcripts_original_dir / f"demo-{source_id}{suffix}"
         metadata_path = self.settings.metadata_dir / f"demo-{source_id}.json"
         transcript_path.write_text("demo text\n", encoding="utf-8")
         metadata_path.write_text("{}", encoding="utf-8")
@@ -51,6 +61,7 @@ def build_test_app(tmp_path: Path):
         task_service=service,
         library=library,
         database=database,
+        settings=settings,
         default_provider="sensevoice",
         default_model="base",
         language="zh-CN",
@@ -58,15 +69,16 @@ def build_test_app(tmp_path: Path):
     return app, service, database, library
 
 
-def test_index_page_renders_form_and_video_list(tmp_path: Path) -> None:
+def test_index_page_renders_studio(tmp_path: Path) -> None:
     app, _, _, _ = build_test_app(tmp_path)
     client = TestClient(app)
 
     response = client.get("/")
     assert response.status_code == 200
-    assert "Bilibili 视频转文字" in response.text
-    assert 'value="sensevoice"' in response.text
-    assert "Videos" in response.text
+    assert "hua-Video2Text-Studio" in response.text
+    assert "data-default-provider=\"sensevoice\"" in response.text
+    assert "识别" in response.text
+    assert "开始转写" in response.text
 
 
 def test_api_transcribe_returns_task_and_video_can_be_edited(tmp_path: Path) -> None:

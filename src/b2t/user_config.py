@@ -37,6 +37,20 @@ class MimoConfig:
 
 
 @dataclass(slots=True)
+class AIConfig:
+    api_key: str = ""
+    base_url: str = "https://api.deepseek.com"
+    model: str = "deepseek-flash"
+
+
+@dataclass(slots=True)
+class DownloadConfig:
+    """Cookie helpers for yt-dlp (X / Instagram / Facebook / gated YouTube / B 站)."""
+
+    cookies_from_browser: str = ""
+
+
+@dataclass(slots=True)
 class AppConfig:
     language: str = DEFAULT_LANGUAGE
     enabled_providers: list[str] = field(default_factory=lambda: ["whisper"])
@@ -46,6 +60,8 @@ class AppConfig:
     sensevoice: SenseVoiceConfig = field(default_factory=SenseVoiceConfig)
     volcengine: VolcengineConfig = field(default_factory=VolcengineConfig)
     mimo: MimoConfig = field(default_factory=MimoConfig)
+    ai: AIConfig = field(default_factory=AIConfig)
+    download: DownloadConfig = field(default_factory=DownloadConfig)
 
     @classmethod
     def load(cls, settings: Settings) -> "AppConfig":
@@ -67,6 +83,8 @@ class AppConfig:
             sensevoice=SenseVoiceConfig(**data.get("sensevoice", {})),
             volcengine=VolcengineConfig(**data.get("volcengine", {})),
             mimo=MimoConfig(**data.get("mimo", {})),
+            ai=AIConfig(**data.get("ai", {})),
+            download=DownloadConfig(**data.get("download", {})),
         )
 
     def save(self, settings: Settings) -> None:

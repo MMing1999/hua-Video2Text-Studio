@@ -1,19 +1,32 @@
 from __future__ import annotations
 
+import platform
+import re
+import subprocess
+import urllib.error
+import urllib.request
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from b2t.ai_transform import AISettings, resolve_ai_settings, transform_text
+from b2t.config import Settings
 from b2t.database import AppDatabase
+from b2t.error_help import explain_error
 from b2t.i18n import tr
-from b2t.inputs import parse_source_list
+from b2t.inputs import AUDIO_SUFFIXES, VIDEO_SUFFIXES, parse_source_list
 from b2t.library import WorkspaceLibrary
 from b2t.models import TaskRecord
+from b2t.preview import preview_source
 from b2t.tasks import TaskService
+from b2t.user_config import AIConfig, AppConfig
 
 
 class TranscribeTaskRequest(BaseModel):
@@ -21,6 +34,8 @@ class TranscribeTaskRequest(BaseModel):
     provider: str = "whisper"
     model: str = "small"
     prompt: str = ""
+    keep_video: bool = False
+    output_format: str = "txt"
 
 
 class BatchTranscribeTaskRequest(BaseModel):
@@ -29,10 +44,14 @@ class BatchTranscribeTaskRequest(BaseModel):
     provider: str = "whisper"
     model: str = "small"
     prompt: str = ""
+    keep_video: bool = False
+    output_format: str = "txt"
 
 
 class TranscriptUpdateRequest(BaseModel):
     text: str
+    kind: str | None = None
+    output_format: str | None = None
 
 
 class CategoryRequest(BaseModel):
@@ -45,34 +64,84 @@ class TagRequest(BaseModel):
     tag_id: int | None = None
 
 
+class PreviewRequest(BaseModel):
+    source: str
+
+
+class RevealRequest(BaseModel):
+    path: str
+
+
+class AISettingsUpdateRequest(BaseModel):
+    api_key: str | None = None
+    base_url: str | None = None
+    model: str | None = None
+
+
+class DownloadSettingsUpdateRequest(BaseModel):
+    cookies_from_browser: str | None = None
+
+
+class AITransformRequest(BaseModel):
+    text: str
+    mode: str = Field(pattern="^(proofread|format)$")
+    instruction: str | None = None
+
+
 def create_app(
     *,
     task_service: TaskService,
     library: WorkspaceLibrary,
     database: AppDatabase,
+    settings: Settings | None = None,
     default_provider: str = "whisper",
     default_model: str = "small",
     language: str = "zh-CN",
 ) -> FastAPI:
+    workspace = settings or library.settings
     templates = Jinja2Templates(directory=str(Path(__file__).with_name("templates")))
-    app = FastAPI(title="bili2text")
+    app = FastAPI(title="hua-Video2Text-Studio")
+
+    project_root = Path(__file__).resolve().parents[2]
+    assets_dir = project_root / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+    def _load_config() -> AppConfig:
+        return AppConfig.load(workspace)
+
+    def _ai_public_payload(config: AppConfig) -> dict:
+        resolved = resolve_ai_settings(
+            AISettings(
+                api_key=config.ai.api_key,
+                base_url=config.ai.base_url,
+                model=config.ai.model,
+            )
+        )
+        key = resolved.api_key or ""
+        masked = ""
+        if key:
+            masked = key if len(key) <= 8 else f"{key[:4]}…{key[-4:]}"
+        return {
+            "configured": bool(key.strip()),
+            "api_key_masked": masked,
+            "has_api_key": bool(key.strip()),
+            "base_url": resolved.base_url,
+            "model": resolved.model,
+        }
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
+        config = _load_config()
         return templates.TemplateResponse(
             request,
             "index.html",
             {
-                "error": None,
-                "values": {
-                    "source": "",
-                    "provider": default_provider,
-                    "model": default_model,
-                    "prompt": "",
-                },
-                "videos": database.list_videos(),
-                "lang": language,
-                "t": lambda key, **kwargs: tr(language, key, **kwargs),
+                "default_provider": default_provider,
+                "default_model": default_model,
+                "language": language,
+                "workspace_root": str(workspace.workspace_root.resolve()),
+                "ai": _ai_public_payload(config),
             },
         )
 
@@ -83,6 +152,7 @@ def create_app(
         provider: str = Form("whisper"),
         model: str = Form("small"),
         prompt: str = Form(""),
+        keep_video: str = Form(""),
     ) -> HTMLResponse:
         try:
             sources = parse_source_list(source)
@@ -91,16 +161,13 @@ def create_app(
                 request,
                 "index.html",
                 {
-                    "error": str(exc),
-                    "values": {
-                        "source": source,
-                        "provider": provider,
-                        "model": model,
-                        "prompt": prompt,
-                    },
-                    "videos": database.list_videos(),
-                    "lang": language,
-                    "t": lambda key, **kwargs: tr(language, key, **kwargs),
+                    "default_provider": provider,
+                    "default_model": model,
+                    "language": language,
+                    "workspace_root": str(workspace.workspace_root.resolve()),
+                    "ai": _ai_public_payload(_load_config()),
+                    "bootstrap_error": str(exc),
+                    "bootstrap_source": source,
                 },
                 status_code=400,
             )
@@ -111,6 +178,7 @@ def create_app(
             provider=provider,
             model=model,
             prompt=prompt,
+            keep_video=keep_video.strip().lower() in {"1", "true", "yes", "on"},
         )
         if len(tasks) > 1:
             return templates.TemplateResponse(
@@ -212,6 +280,244 @@ def create_app(
             database.add_video_tag(video_id, int(tag["id"]))
         return RedirectResponse(url=f"/videos/{video_id}", status_code=303)
 
+    @app.post("/api/preview")
+    async def preview_api(payload: PreviewRequest) -> JSONResponse:
+        config = _load_config()
+        cookie_path = workspace.workspace_root / "cookies.txt"
+        return JSONResponse(
+            preview_source(
+                payload.source,
+                cookies_from_browser=config.download.cookies_from_browser.strip() or None,
+                cookie_file=cookie_path if cookie_path.exists() else None,
+            )
+        )
+
+    @app.get("/api/thumbnail")
+    async def thumbnail_proxy(url: str = Query(...)) -> Response:
+        """Proxy remote cover images to bypass CDN hotlink checks in the browser."""
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise HTTPException(status_code=400, detail="invalid thumbnail url")
+        host = parsed.netloc.lower()
+        allowed = (
+            "hdslb.com",
+            "bilibili.com",
+            "bilivideo.com",
+            "akamaized.net",
+            "ytimg.com",
+            "googleusercontent.com",
+            "ggpht.com",
+            "acfun.cn",
+            "aixifan.com",
+            "twimg.com",
+            "cdninstagram.com",
+            "fbcdn.net",
+            "facebook.com",
+            "douyinpic.com",
+            "douyin.com",
+            "xhscdn.com",
+            "xiaohongshu.com",
+            "rednote.com",
+        )
+        if not any(host == domain or host.endswith("." + domain) for domain in allowed):
+            raise HTTPException(status_code=400, detail="thumbnail host not allowed")
+
+        referer = "https://www.bilibili.com/"
+        if any(host.endswith(d) for d in ("ytimg.com", "googleusercontent.com", "ggpht.com")):
+            referer = "https://www.youtube.com/"
+        elif any(host.endswith(d) for d in ("acfun.cn", "aixifan.com")):
+            referer = "https://www.acfun.cn/"
+        elif any(host.endswith(d) for d in ("twimg.com",)):
+            referer = "https://x.com/"
+        elif any(host.endswith(d) for d in ("cdninstagram.com",)):
+            referer = "https://www.instagram.com/"
+        elif any(host.endswith(d) for d in ("fbcdn.net", "facebook.com")):
+            referer = "https://www.facebook.com/"
+        elif any(host.endswith(d) for d in ("douyinpic.com", "douyin.com")):
+            referer = "https://www.douyin.com/"
+        elif any(host.endswith(d) for d in ("xhscdn.com", "xiaohongshu.com", "rednote.com")):
+            referer = "https://www.xiaohongshu.com/"
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Referer": referer,
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=12) as resp:
+                content = resp.read()
+                content_type = resp.headers.get("Content-Type") or "image/jpeg"
+        except urllib.error.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"thumbnail fetch failed: HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise HTTPException(status_code=502, detail=f"thumbnail fetch failed: {exc.reason}") from exc
+
+        return Response(
+            content=content,
+            media_type=content_type.split(";")[0].strip() or "image/jpeg",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    @app.post("/api/upload")
+    async def upload_media(file: UploadFile = File(...)) -> JSONResponse:
+        filename = Path(file.filename or "upload.bin").name
+        suffix = Path(filename).suffix.lower()
+        allowed = AUDIO_SUFFIXES | VIDEO_SUFFIXES
+        if suffix not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported file type: {suffix or '(none)'}. allowed: {', '.join(sorted(allowed))}",
+            )
+
+        workspace.ensure_directories()
+        stem = Path(filename).stem
+        safe_stem = re.sub(r"[^\w.-]+", "-", stem, flags=re.UNICODE).strip("-._") or "upload"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = workspace.uploads_dir / f"{safe_stem}-{stamp}{suffix}"
+
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="empty file")
+        target.write_bytes(data)
+        path = str(target.resolve())
+        return JSONResponse(
+            {
+                "ok": True,
+                "path": path,
+                "filename": filename,
+                "size_bytes": len(data),
+            }
+        )
+
+    @app.get("/api/workspace")
+    async def workspace_api() -> JSONResponse:
+        def folder_info(path: Path) -> dict:
+            exists = path.exists()
+            count = 0
+            if exists and path.is_dir():
+                count = sum(1 for item in path.iterdir() if item.is_file())
+            return {
+                "path": str(path.resolve()),
+                "exists": exists,
+                "file_count": count,
+            }
+
+        return JSONResponse(
+            {
+                "workspace_root": str(workspace.workspace_root.resolve()),
+                "folders": {
+                    "downloads": folder_info(workspace.downloads_dir),
+                    "uploads": folder_info(workspace.uploads_dir),
+                    "audio": folder_info(workspace.audio_dir),
+                    "transcripts_original": folder_info(workspace.transcripts_original_dir),
+                    "transcripts_edited": folder_info(workspace.transcripts_edited_dir),
+                    "metadata": folder_info(workspace.metadata_dir),
+                },
+            }
+        )
+
+    @app.post("/api/workspace/reveal")
+    async def reveal_path(payload: RevealRequest) -> JSONResponse:
+        target = Path(payload.path).expanduser()
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="path not found")
+        system = platform.system()
+        try:
+            if system == "Darwin":
+                subprocess.run(["open", "-R", str(target)], check=False)
+            elif system == "Windows":
+                subprocess.run(["explorer", "/select,", str(target)], check=False)
+            else:
+                parent = target if target.is_dir() else target.parent
+                subprocess.run(["xdg-open", str(parent)], check=False)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return JSONResponse({"ok": True, "path": str(target)})
+
+    def _download_public_payload(config: AppConfig) -> dict:
+        cookie_path = workspace.workspace_root / "cookies.txt"
+        return {
+            "cookies_from_browser": config.download.cookies_from_browser or "",
+            "cookie_file": str(cookie_path),
+            "cookie_file_exists": cookie_path.exists(),
+        }
+
+    @app.get("/api/settings/ai")
+    async def get_ai_settings() -> JSONResponse:
+        return JSONResponse(_ai_public_payload(_load_config()))
+
+    @app.put("/api/settings/ai")
+    async def update_ai_settings(payload: AISettingsUpdateRequest) -> JSONResponse:
+        config = _load_config()
+        if payload.api_key is not None:
+            config.ai.api_key = payload.api_key.strip()
+        if payload.base_url is not None:
+            config.ai.base_url = payload.base_url.strip() or AIConfig().base_url
+        if payload.model is not None:
+            config.ai.model = payload.model.strip() or AIConfig().model
+        config.save(workspace)
+        return JSONResponse(_ai_public_payload(config))
+
+    @app.get("/api/settings/download")
+    async def get_download_settings() -> JSONResponse:
+        return JSONResponse(_download_public_payload(_load_config()))
+
+    @app.put("/api/settings/download")
+    async def update_download_settings(payload: DownloadSettingsUpdateRequest) -> JSONResponse:
+        config = _load_config()
+        if payload.cookies_from_browser is not None:
+            value = payload.cookies_from_browser.strip().lower()
+            allowed = {"", "chrome", "safari", "firefox", "edge", "brave", "chromium"}
+            if value not in allowed and ":" not in value:
+                raise HTTPException(
+                    status_code=400,
+                    detail="cookies_from_browser must be empty or chrome/safari/firefox/edge/brave",
+                )
+            config.download.cookies_from_browser = value
+        config.save(workspace)
+        return JSONResponse(_download_public_payload(config))
+
+    @app.post("/api/ai/transform")
+    async def ai_transform(payload: AITransformRequest) -> JSONResponse:
+        config = _load_config()
+        try:
+            text = transform_text(
+                payload.text,
+                mode=payload.mode,  # type: ignore[arg-type]
+                settings=resolve_ai_settings(
+                    AISettings(
+                        api_key=config.ai.api_key,
+                        base_url=config.ai.base_url,
+                        model=config.ai.model,
+                    )
+                ),
+                instruction=payload.instruction,
+            )
+        except Exception as exc:  # noqa: BLE001
+            help_payload = explain_error(exc)
+            raise HTTPException(
+                status_code=400,
+                detail={"message": str(exc), "help": help_payload},
+            ) from exc
+        return JSONResponse({"text": text, "mode": payload.mode})
+
+    @app.get("/api/videos/{video_id}/transcript/download")
+    async def download_transcript(video_id: int, version_id: int | None = Query(None)) -> FileResponse:
+        if version_id is None:
+            data = library.load_active_transcript(video_id)
+        else:
+            data = library.load_transcript_version(video_id, version_id)
+        path = Path(str(data["file_path"]))
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="transcript file not found")
+        return FileResponse(path, filename=path.name, media_type="text/plain; charset=utf-8")
+
     @app.post("/api/tasks/transcribe")
     async def create_transcription_task(payload: TranscribeTaskRequest) -> JSONResponse:
         task = task_service.submit_transcription(
@@ -219,6 +525,8 @@ def create_app(
             provider=payload.provider,
             model=payload.model,
             prompt=payload.prompt,
+            keep_video=payload.keep_video,
+            output_format=payload.output_format,
         )
         return JSONResponse({"task_id": task.id, "status": task.status})
 
@@ -237,6 +545,8 @@ def create_app(
             provider=payload.provider,
             model=payload.model,
             prompt=payload.prompt,
+            keep_video=payload.keep_video,
+            output_format=payload.output_format,
         )
         return JSONResponse(
             {
@@ -252,7 +562,12 @@ def create_app(
     ) -> JSONResponse:
         return JSONResponse(
             {
-                "items": [asdict(task) for task in task_service.list_tasks() if (status is None or task.status == status) and (provider is None or task.provider == provider)],
+                "items": [
+                    asdict(task)
+                    for task in task_service.list_tasks()
+                    if (status is None or task.status == status)
+                    and (provider is None or task.provider == provider)
+                ],
                 "filters": {"status": status, "provider": provider},
             }
         )
@@ -262,14 +577,20 @@ def create_app(
         task = task_service.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
-        return JSONResponse(asdict(task))
+        payload = asdict(task)
+        if task.status == "failed" and task.error_message:
+            payload["help"] = explain_error(task.error_message)
+        return JSONResponse(payload)
 
     @app.get("/api/tasks/{task_id}/progress")
     async def get_task_progress(task_id: str) -> JSONResponse:
         task = task_service.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
-        return JSONResponse(asdict(task))
+        payload = asdict(task)
+        if task.status == "failed" and task.error_message:
+            payload["help"] = explain_error(task.error_message)
+        return JSONResponse(payload)
 
     @app.get("/api/tasks/{task_id}/events")
     async def get_task_events(task_id: str) -> JSONResponse:
@@ -308,13 +629,25 @@ def create_app(
             return JSONResponse(library.load_active_transcript(video_id))
         return JSONResponse(library.load_transcript_version(video_id, version_id))
 
+    @app.get("/api/videos/{video_id}/transcript/props")
+    async def get_video_transcript_props(video_id: int) -> JSONResponse:
+        try:
+            return JSONResponse(library.load_transcript_props(video_id))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.get("/api/videos/{video_id}/metadata")
     async def get_video_metadata(video_id: int) -> JSONResponse:
         return JSONResponse(library.load_video_metadata(video_id))
 
     @app.put("/api/videos/{video_id}/transcript")
     async def update_video_transcript(video_id: int, payload: TranscriptUpdateRequest) -> JSONResponse:
-        version_id = library.save_edited_transcript(video_id, payload.text)
+        version_id = library.save_edited_transcript(
+            video_id,
+            payload.text,
+            kind=payload.kind or "edited",
+            output_format=payload.output_format,
+        )
         return JSONResponse({"video_id": video_id, "version_id": version_id})
 
     @app.get("/api/videos/{video_id}/versions")
@@ -420,6 +753,8 @@ def _submit_transcription_tasks(
     provider: str,
     model: str,
     prompt: str = "",
+    keep_video: bool = False,
+    output_format: str = "txt",
 ) -> list[TaskRecord]:
     return [
         task_service.submit_transcription(
@@ -427,6 +762,8 @@ def _submit_transcription_tasks(
             provider=provider,
             model=model,
             prompt=prompt,
+            keep_video=keep_video,
+            output_format=output_format,
         )
         for source in sources
     ]
